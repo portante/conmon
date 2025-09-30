@@ -64,29 +64,20 @@ static int64_t k8s_total_bytes_written;
 #define PARTIAL_MESSAGE_EQ_LEN 30
 // SYSLOG_IDENTIFIER=
 #define SYSLOG_IDENTIFIER_EQ_LEN 18
-static char short_cuuid[TRUNC_ID_LEN + 1];
-static char *cuuid = NULL;
-static char *name = NULL;
-static size_t cuuid_len = 0;
-static size_t name_len = 0;
-static char *container_id_full = NULL;
-static char *container_id = NULL;
-static char *container_name = NULL;
-static char *container_tag = NULL;
-static gchar **container_labels = NULL;
-static size_t container_tag_len;
-static char *syslog_identifier = NULL;
-static size_t syslog_identifier_len;
+
+static struct {
+	size_t iovcnt;
+	struct iovec *iov;
+} jctx = {0};
 
 #define WRITEV_BUFFER_N_IOV 128
 
 static void parse_log_path(char *log_config);
 static const char *stdpipe_name(stdpipe_t pipe);
-static int write_journald(int pipe, char *buf, size_t buflen);
+static int write_journald(stdpipe_t pipe, char *buf, size_t buflen);
 static int write_k8s_log(stdpipe_t pipe, const char *buf, size_t buflen);
 static bool get_line_len(ptrdiff_t *line_len, const char *buf, size_t buflen);
 static ssize_t writev_buffer_append_segment(int fd, writev_iov_t *buf, const void *data, size_t len);
-static ssize_t writev_buffer_append_segment_no_flush(writev_iov_t *buf, const void *data, size_t len);
 static void set_k8s_timestamp(char *buf, size_t buflen, const char *pipename);
 static void reopen_k8s_file(void);
 static int parse_priority_prefix(const char *buf, size_t buflen, int *priority, const char **message_start);
@@ -137,7 +128,7 @@ static int is_valid_label_name(const char *str)
  * (currently just k8s log file), it will also open the log_fd for that specific
  * log file.
  */
-void configure_log_drivers(gchar **log_drivers, int64_t log_size_max_, int64_t log_global_size_max_, char *cuuid_, char *name_, char *tag,
+void configure_log_drivers(gchar **log_drivers, int64_t log_size_max_, int64_t log_global_size_max_, char *cuuid, char *name, char *tag,
 			   gchar **log_labels)
 {
 	log_size_max = log_size_max_;
@@ -176,46 +167,10 @@ void configure_log_drivers(gchar **log_drivers, int64_t log_size_max_, int64_t l
 #ifndef USE_JOURNALD
 		nexit("Include journald in compilation path to log to systemd journal");
 #endif
-		/* save the length so we don't have to compute every sd_journal_* call */
-		if (cuuid_ == NULL)
-			nexit("Container ID must be provided and of the correct length");
-		cuuid_len = strlen(cuuid_);
-		if (cuuid_len <= TRUNC_ID_LEN)
-			nexit("Container ID must be longer than 12 characters");
-
-		cuuid = cuuid_;
-		strncpy(short_cuuid, cuuid, TRUNC_ID_LEN);
-		short_cuuid[TRUNC_ID_LEN] = '\0';
-		name = name_;
-
-		/* Setup some sd_journal_sendv arguments that won't change */
-		container_id_full = g_strdup_printf("CONTAINER_ID_FULL=%s", cuuid);
-		container_id = g_strdup_printf("CONTAINER_ID=%s", short_cuuid);
-
-		/* Priority order of syslog_identifier (in order of precedence) is tag, name, `conmon`. */
-		syslog_identifier = g_strdup_printf("SYSLOG_IDENTIFIER=%s", short_cuuid);
-		syslog_identifier_len = TRUNC_ID_LEN + SYSLOG_IDENTIFIER_EQ_LEN;
-		if (name) {
-			name_len = strlen(name);
-			container_name = g_strdup_printf("CONTAINER_NAME=%s", name);
-
-			g_free(syslog_identifier);
-			syslog_identifier = g_strdup_printf("SYSLOG_IDENTIFIER=%s", name);
-			syslog_identifier_len = name_len + SYSLOG_IDENTIFIER_EQ_LEN;
-		}
-		if (tag) {
-			container_tag = g_strdup_printf("CONTAINER_TAG=%s", tag);
-			container_tag_len = strlen(container_tag);
-
-			g_free(syslog_identifier);
-			syslog_identifier = g_strdup_printf("SYSLOG_IDENTIFIER=%s", tag);
-			syslog_identifier_len = strlen(syslog_identifier);
-		}
+		size_t log_labels_cnt = 0;
 		if (log_labels) {
-			container_labels = log_labels;
-
 			/* Ensure that valid LABEL=VALUE pairs have been passed */
-			for (char **ptr = log_labels; *ptr; ptr++) {
+			for (char **ptr = log_labels; *ptr; ptr++, log_labels_cnt++) {
 				if (**ptr == '=') {
 					nexitf("Container labels must be in format LABEL=VALUE (no LABEL present in '%s')", *ptr);
 				}
@@ -228,6 +183,74 @@ void configure_log_drivers(gchar **log_drivers, int64_t log_size_max_, int64_t l
 					       *ptr);
 				}
 			}
+		}
+		/*
+		 * Calculate how many io vectors we'll need for all the labels:
+		 *   Required:
+		 *     [0] MESSAGE=
+		 *     [1] PRIORITY=
+		 *     [2] CONTAINER_ID_FULL=
+		 *     [3] CONTAINER_ID=
+		 *     [4] SYSLOG_IDENTIFIER=
+		 *     [5] CONTAINER_PARTIAL_MESSAGE=
+		 *   Optional:
+		 *     [6] CONTAINER_TAG=
+		 *     [7] CONTAINER_NAME=
+		 *     [...] <container labels>
+		 *
+		 * Note that the CONTAINER_PARTIAL_MESSAGE will always be last.
+		 */
+		jctx.iovcnt = 6 + (name ? 1 : 0) + (tag ? 1 : 0) + log_labels_cnt;
+		/*_cleanup_free_*/ jctx.iov = g_malloc(jctx.iovcnt * sizeof(struct iovec));
+
+		char short_cuuid[TRUNC_ID_LEN + 1];
+
+		if (cuuid == NULL)
+			nexit("Container ID must be provided and of the correct length");
+		size_t cuuid_len = strlen(cuuid);
+		if (cuuid_len <= TRUNC_ID_LEN)
+			nexit("Container ID must be longer than 12 characters");
+		strncpy(short_cuuid, cuuid, TRUNC_ID_LEN);
+		short_cuuid[TRUNC_ID_LEN] = '\0';
+
+		/* Setup some sd_journal_sendv arguments that won't change */
+		jctx.iov[2].iov_base = g_strdup_printf("CONTAINER_ID_FULL=%s", cuuid);
+		jctx.iov[2].iov_len = strlen(jctx.iov[2].iov_base);
+		jctx.iov[3].iov_base = g_strdup_printf("CONTAINER_ID=%s", short_cuuid);
+		jctx.iov[3].iov_len = strlen(jctx.iov[3].iov_base);
+
+		/* Priority order of syslog_identifier (in order of precedence) is tag, name, `conmon`. */
+		char *syslog_identifier = short_cuuid;
+		size_t next_iovidx = 5;
+		if (name != NULL) {
+			syslog_identifier = name;
+			jctx.iov[next_iovidx].iov_base = g_strdup_printf("CONTAINER_NAME=%s", name);
+			jctx.iov[next_iovidx].iov_len = strlen(jctx.iov[next_iovidx].iov_base); 
+			next_iovidx++;
+		}
+		if (tag != NULL) {
+			syslog_identifier = tag;
+			jctx.iov[next_iovidx].iov_base = g_strdup_printf("CONTAINER_TAG=%s", tag);
+			jctx.iov[next_iovidx].iov_len = strlen(jctx.iov[next_iovidx].iov_base);
+			next_iovidx++;
+		}
+		jctx.iov[4].iov_base = g_strdup_printf("SYSLOG_IDENTIFIER=%s", syslog_identifier);
+		jctx.iov[4].iov_len = strlen(jctx.iov[4].iov_base);
+		if (log_labels) {
+			for (char **ptr = log_labels; *ptr; ptr++, next_iovidx++) {
+				jctx.iov[next_iovidx].iov_base = *ptr;
+				jctx.iov[next_iovidx].iov_len = strlen(*ptr);
+			}
+		}
+		/*
+		 * Note: while we setup the partial indicator, the count used in write_journald() will either
+		 * include or exclude it.
+		 */
+		jctx.iov[next_iovidx].iov_base = "CONTAINER_PARTIAL_MESSAGE=true";
+		jctx.iov[next_iovidx].iov_len = PARTIAL_MESSAGE_EQ_LEN;
+
+		if (next_iovidx != (jctx.iovcnt - 1)) {
+			nexit("Logic bomb! The count of struct iovec entries does not add up");
 		}
 	}
 }
@@ -350,27 +373,15 @@ static int parse_priority_prefix(const char *buf, size_t buflen, int *priority, 
 	return 1;
 }
 
-/* write to systemd journal. If the pipe is stdout, write with notice priority,
- * otherwise, write with error priority. Partial lines (that don't end in a newline) are buffered
- * between invocations. A 0 buflen argument forces a buffered partial line to be flushed.
+/* Write to systemd journal. If the pipe is stdout, write with `notice` default priority, otherwise, write
+ * with `error` default priority. Partial lines (that don't end in a newline) are buffered between
+ * invocations.
  */
-static int write_journald(int pipe, char *buf, size_t buflen)
+static int write_journald(stdpipe_t pipe, char *buf, size_t buflen)
 {
-	static char *stdout_partial_buf = NULL;
-	static size_t stdout_partial_buf_len = 0;
-	static char *stderr_partial_buf = NULL;
-	static size_t stderr_partial_buf_len = 0;
-	size_t buf_size = (pipe == STDOUT_PIPE ? mainfd_stdout_size : mainfd_stderr_size);
-
-	if (stdout_partial_buf == NULL) {
-		stdout_partial_buf = g_malloc(mainfd_stdout_size);
-	}
-	if (stderr_partial_buf == NULL) {
-		stderr_partial_buf = g_malloc(mainfd_stderr_size);
-	}
-
-	char *partial_buf;
-	size_t *partial_buf_len;
+	int ret_val = 0;
+	char *message = alloca(LINE_MAX);
+	memcpy(message, "MESSAGE=", MESSAGE_EQ_LEN);
 
 	/* Default priority values: 6 (info) for stdout, 3 (err) for stderr
 	 * These may be overridden by systemd priority prefixes in the message.
@@ -378,30 +389,16 @@ static int write_journald(int pipe, char *buf, size_t buflen)
 	int default_priority = (pipe == STDERR_PIPE) ? 3 : 6;
 	char priority_str[PRIORITY_EQ_LEN + 2]; /* "PRIORITY=" + digit + null terminator */
 
-	if (pipe == STDERR_PIPE) {
-		partial_buf = stderr_partial_buf;
-		partial_buf_len = &stderr_partial_buf_len;
-	} else {
-		partial_buf = stdout_partial_buf;
-		partial_buf_len = &stdout_partial_buf_len;
-	}
+	/* [0] MESSAGE=... */
+	jctx.iov[0].iov_base = message;
+	/* [1] PRIORITY=... */
+	jctx.iov[1].iov_base = priority_str;
 
-	ptrdiff_t line_len = 0;
+	ptrdiff_t line_len;
 
-	while (buflen > 0 || *partial_buf_len > 0) {
-		struct iovec vecs[WRITEV_BUFFER_N_IOV];
-		writev_iov_t bufv = {0, WRITEV_BUFFER_N_IOV, vecs};
-
-		bool partial = buflen == 0 || get_line_len(&line_len, buf, buflen);
-
-		/* If this is a partial line, and we have capacity to buffer it, buffer it and return.
-		 * The capacity of the partial_buf is one less than its size so that we can always add
-		 * a null terminating char later */
-		if (buflen && partial && ((unsigned long)line_len < (buf_size - *partial_buf_len))) {
-			memcpy(partial_buf + *partial_buf_len, buf, line_len);
-			*partial_buf_len += line_len;
-			return 0;
-		}
+	while (buflen > 0) {
+		line_len = 0;
+		bool partial = get_line_len(&line_len, buf, buflen);
 
 		/* Check for systemd priority prefix in the message */
 		int parsed_priority = default_priority;
@@ -409,7 +406,7 @@ static int write_journald(int pipe, char *buf, size_t buflen)
 		ssize_t actual_message_len = line_len;
 
 		/* Try to parse priority prefix from the complete message */
-		if (*partial_buf_len == 0 && line_len > 0) {
+		if (line_len > 0) {
 			/* Only check for priority prefix at the start of a new line */
 			int parse_result = parse_priority_prefix(buf, line_len, &parsed_priority, &actual_message_start);
 			if (parse_result == 1) {
@@ -424,61 +421,49 @@ static int write_journald(int pipe, char *buf, size_t buflen)
 			actual_message_start = buf;
 		}
 
-		ssize_t msg_len = actual_message_len + MESSAGE_EQ_LEN + *partial_buf_len;
-
-		_cleanup_free_ char *message = g_malloc(msg_len);
-
-		memcpy(message, "MESSAGE=", MESSAGE_EQ_LEN);
-		memcpy(message + MESSAGE_EQ_LEN, partial_buf, *partial_buf_len);
-		memcpy(message + MESSAGE_EQ_LEN + *partial_buf_len, actual_message_start, actual_message_len);
-
 		/* Format the priority string */
 		snprintf(priority_str, sizeof(priority_str), "PRIORITY=%d", parsed_priority);
 
-		if (writev_buffer_append_segment_no_flush(&bufv, message, msg_len) < 0)
-			return -1;
+		while (actual_message_len > 0) {
+			/*
+			 * We only send at most LINE_MAX chunks of the message to jouranld
+			 * since it will truncate any message that is longer.
+			 */
+			size_t send_msg_len = MIN((LINE_MAX - MESSAGE_EQ_LEN), actual_message_len);
+			size_t msg_len = send_msg_len + MESSAGE_EQ_LEN;
 
-		if (writev_buffer_append_segment_no_flush(&bufv, container_id_full, cuuid_len + CID_FULL_EQ_LEN) < 0)
-			return -1;
+			memcpy(message + MESSAGE_EQ_LEN, actual_message_start, send_msg_len);
+			actual_message_start += send_msg_len;
+			actual_message_len -= send_msg_len;
 
-		if (writev_buffer_append_segment_no_flush(&bufv, priority_str, strlen(priority_str)) < 0)
-			return -1;
+			/* [0] MESSAGE=... */
+			jctx.iov[0].iov_len = msg_len;
+			/* [1] PRIORITY=... */
+			jctx.iov[1].iov_len = sizeof(priority_str) - 1;
 
-		if (writev_buffer_append_segment_no_flush(&bufv, container_id, TRUNC_ID_LEN + CID_EQ_LEN) < 0)
-			return -1;
-
-		if (container_tag && writev_buffer_append_segment_no_flush(&bufv, container_tag, container_tag_len) < 0)
-			return -1;
-
-		/* only print the name if we have a name to print */
-		if (name && writev_buffer_append_segment_no_flush(&bufv, container_name, name_len + NAME_EQ_LEN) < 0)
-			return -1;
-
-		if (writev_buffer_append_segment_no_flush(&bufv, syslog_identifier, syslog_identifier_len) < 0)
-			return -1;
-
-		/* per docker journald logging format, CONTAINER_PARTIAL_MESSAGE is set to true if it's partial, but otherwise not set. */
-		if (partial && !opt_no_container_partial_message
-		    && writev_buffer_append_segment_no_flush(&bufv, "CONTAINER_PARTIAL_MESSAGE=true", PARTIAL_MESSAGE_EQ_LEN) < 0)
-			return -1;
-		if (container_labels) {
-			for (gchar **label = container_labels; *label; ++label) {
-				if (writev_buffer_append_segment_no_flush(&bufv, *label, strlen(*label)) < 0)
-					return -1;
+			/* per docker journald logging format, CONTAINER_PARTIAL_MESSAGE is set to true if it's partial, but otherwise not set. */
+			int iovcnt = jctx.iovcnt - 1;
+			if ((partial || actual_message_len > 0) && !opt_no_container_partial_message) {
+				iovcnt++;
 			}
-		}
 
-		int err = sd_journal_sendv(bufv.iov, bufv.iovcnt);
-		if (err < 0) {
-			nwarnf("sd_journal_sendv: %s", strerror(-err));
-			return err;
+			int err = sd_journal_sendv(jctx.iov, iovcnt);
+			if (err < 0) {
+				nwarnf("sd_journal_sendv: %s", strerror(-err));
+				ret_val = err;
+				goto exit;
+			}
 		}
 
 		buf += line_len;
 		buflen -= line_len;
-		*partial_buf_len = 0;
 	}
-	return 0;
+exit:
+	jctx.iov[0].iov_base = NULL;
+	jctx.iov[0].iov_len = 0;
+	jctx.iov[1].iov_base = NULL;
+	jctx.iov[1].iov_len = 0;
+	return ret_val;
 }
 
 /*
@@ -627,7 +612,7 @@ static bool get_line_len(ptrdiff_t *line_len, const char *buf, size_t buflen)
 	return partial;
 }
 
-ssize_t writev_buffer_append_segment(int fd, writev_iov_t *buf, const void *data, size_t len)
+static ssize_t writev_buffer_append_segment(int fd, writev_iov_t *buf, const void *data, size_t len)
 {
 	if (data == NULL)
 		return 1;
@@ -643,24 +628,6 @@ ssize_t writev_buffer_append_segment(int fd, writev_iov_t *buf, const void *data
 
 	return 1;
 }
-
-ssize_t writev_buffer_append_segment_no_flush(writev_iov_t *buf, const void *data, size_t len)
-{
-	if (data == NULL)
-		return 1;
-
-	if (buf->iovcnt == buf->max_iovcnt)
-		return -1;
-
-	if (len > 0) {
-		buf->iov[buf->iovcnt].iov_base = (void *)data;
-		buf->iov[buf->iovcnt].iov_len = (size_t)len;
-		buf->iovcnt++;
-	}
-
-	return 1;
-}
-
 
 static const char *stdpipe_name(stdpipe_t pipe)
 {
